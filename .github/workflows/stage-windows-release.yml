@@ -1,0 +1,62 @@
+name: Stage validated Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: Short-lived download URL for the validated Windows build artifact
+        required: true
+      installer_sha256:
+        description: Expected SHA-256 of the installer
+        required: true
+      version:
+        required: true
+        default: '26.9.17'
+      target_commit:
+        required: true
+        default: main
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ARTIFACT_URL: ${{ inputs.artifact_url }}
+      EXPECTED_SHA: ${{ inputs.installer_sha256 }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      TARGET_COMMIT: ${{ inputs.target_commit }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and verify the already-tested installer
+        shell: bash
+        run: |
+          echo "::add-mask::$ARTIFACT_URL"
+          python3 - <<'PY'
+          import hashlib,os,pathlib,re,urllib.request,zipfile
+          version=os.environ['RELEASE_VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          url=os.environ['ARTIFACT_URL']
+          assert url.startswith('https://')
+          with urllib.request.urlopen(url,timeout=120) as source,open('artifact.zip','wb') as target:
+              import shutil
+              shutil.copyfileobj(source,target)
+          name=f'CentaurMD-{version}-x64.exe'
+          expected={name,name+'.blockmap',name+'.sha256','latest.yml'}
+          with zipfile.ZipFile('artifact.zip') as archive:
+              assert set(archive.namelist())==expected
+              archive.extractall('assets')
+          root=pathlib.Path('assets')
+          digest=hashlib.file_digest((root/name).open('rb'),'sha256').hexdigest()
+          assert digest==os.environ['EXPECTED_SHA']
+          assert (root/(name+'.sha256')).read_text().split()[0]==digest
+          assert f'version: {version}' in (root/'latest.yml').read_text()
+          print(f'Verified Windows {version}: {digest}')
+          PY
+      - name: Stage release assets
+        shell: bash
+        run: |
+          tag="v$RELEASE_VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$TARGET_COMMIT" --draft --title "CentaurMD $RELEASE_VERSION testing release" --notes 'Validated unsigned Windows testing installer. Publication follows release verification.'
+          fi
+          gh release upload "$tag" assets/* --repo "$GITHUB_REPOSITORY"
