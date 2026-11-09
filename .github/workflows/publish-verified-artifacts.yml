@@ -1,0 +1,93 @@
+name: Publish verified desktop artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      mac_url:
+        description: Temporary read-only URL for the signed Mac artifact
+        required: true
+      windows_url:
+        description: Temporary read-only URL for the signed Windows artifact
+        required: true
+      mac_digest:
+        description: Verified Mac artifact archive SHA-256
+        required: true
+      windows_digest:
+        description: Verified Windows artifact archive SHA-256
+        required: true
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+      - name: Retrieve exact signed and tested 26.11.9 artifacts
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const {pipeline} = require('node:stream/promises');
+          const {Readable} = require('node:stream');
+          const crypto = require('node:crypto');
+          const assert = require('node:assert/strict');
+          (async () => {
+            const inputs = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH)).inputs;
+            const expected = {mac:'9b14d75bc36fa0eeeda24ba74fdd6d6acc8156e2f3a3452fc7791d6a88234c33',windows:'5d1dfc5f9d5a638ff6a5e7540be96a6da6ef3c997a79ae9c02fde77850201359'};
+            await Promise.all(['mac','windows'].map(async platform => {
+              const url = inputs[platform+'_url'];
+              console.log('::add-mask::'+url);
+              const parsed = new URL(url);
+              assert.equal(parsed.protocol,'https:');
+              assert.ok(parsed.hostname.endsWith('.blob.core.windows.net') || parsed.hostname.endsWith('.githubusercontent.com'));
+              assert.equal(inputs[platform+'_digest'],expected[platform]);
+              const response = await fetch(url,{signal:AbortSignal.timeout(300000)});
+              assert.equal(response.status,200);
+              await pipeline(Readable.fromWeb(response.body),fs.createWriteStream(platform+'.zip'));
+              assert.equal(crypto.createHash('sha256').update(fs.readFileSync(platform+'.zip')).digest('hex'),expected[platform]);
+              console.log(platform+' signed artifact digest verified');
+            }));
+          })().catch(e=>{console.error(e.name);process.exitCode=1;});
+          NODE
+      - name: Extract only validated release assets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import zipfile, pathlib, re
+          dest=pathlib.Path('release-assets'); dest.mkdir()
+          for platform in ('mac','windows'):
+              with zipfile.ZipFile(platform+'.zip') as archive:
+                  for item in archive.infolist():
+                      assert re.fullmatch(r'(CentaurMD-26\.11\.9\.(dmg|zip|exe)(\.sha256|\.blockmap)?|latest(-mac)?\.yml)',item.filename)
+                      target=dest/item.filename
+                      assert not target.exists()
+                      target.write_bytes(archive.read(item))
+          assert len(list(dest.iterdir()))==10
+          PY
+          node <<'NODE'
+          const fs=require('node:fs'), crypto=require('node:crypto'), assert=require('node:assert/strict');
+          const hash=(name,type,encoding)=>crypto.createHash(type).update(fs.readFileSync('release-assets/'+name)).digest(encoding);
+          for(const ext of ['dmg','exe']){
+            const name='CentaurMD-26.11.9.'+ext;
+            assert.equal(hash(name,'sha256','hex'),fs.readFileSync('release-assets/'+name+'.sha256','utf8').trim().split(/\s+/)[0]);
+          }
+          for(const name of ['latest.yml','latest-mac.yml']){
+            const text=fs.readFileSync('release-assets/'+name,'utf8');assert.match(text,/^version: 26\.11\.9$/m);
+            const entries=[...text.matchAll(/url: (CentaurMD-26\.11\.9\.(?:exe|zip|dmg))\s+sha512: ([A-Za-z0-9+/=]+)\s+size: (\d+)/g)];
+            assert.equal(entries.length,name==='latest.yml'?1:2);
+            for(const [,file,sha512,size] of entries){assert.equal(hash(file,'sha512','base64'),sha512);assert.equal(fs.statSync('release-assets/'+file).size,Number(size));}
+          }
+          console.log('Both platforms and update manifests validated');
+          NODE
+      - name: Publish synchronized release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          test "$(gh release view v26.11.9 --json isDraft --jq .isDraft)" = "true"
+          gh release upload v26.11.9 release-assets/* --clobber
+          test "$(gh release view v26.11.9 --json assets --jq '.assets | length')" = "10"
+          gh release edit v26.11.9 --draft=false --latest
